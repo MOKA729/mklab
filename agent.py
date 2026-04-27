@@ -1,87 +1,64 @@
-"""Splunk findings prioritization agent.
+"""Splunk findings prioritization agent — simple version.
 
-Connects to a Splunk MCP server, pulls findings/alerts, and asks Claude to
-triage them by risk. The agent uses Claude as an MCP client: Splunk MCP
-tools are exposed to Claude via the Anthropic SDK's `async_mcp_tool`
-helper, and Claude drives the search + analysis loop itself.
+How it works:
+1. Set MCP_SERVER_URL and SPLUNK_TOKEN below.
+2. Run `python agent.py`. A popup asks what you want to prioritize.
+3. Claude connects to the Splunk MCP server, pulls findings via its tools,
+   and prints a ranked priority list to the terminal.
 """
 
-from __future__ import annotations
+# ============================================================================
+# CONFIG — edit these two values
+# ============================================================================
+MCP_SERVER_URL = "https://your-splunk-mcp-server.example.com/sse"
+SPLUNK_TOKEN = "your-splunk-token-here"
+# ============================================================================
 
-import argparse
 import asyncio
 import json
 import os
-import shlex
 import sys
-from contextlib import asynccontextmanager
-from typing import AsyncIterator
+import tkinter as tk
+from tkinter import scrolledtext
 
 from anthropic import AsyncAnthropic
 from anthropic.lib.tools.mcp import async_mcp_tool
-from dotenv import load_dotenv
 from mcp import ClientSession
 from mcp.client.sse import sse_client
-from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
 PRIORITIZATION_RUBRIC = """\
-You are a senior detection-engineering analyst. Your job is to triage a
-batch of security findings pulled from Splunk and produce a ranked,
-actionable priority list.
+You are a senior detection-engineering analyst. Triage the security findings
+the user asks about and produce a ranked priority list.
 
 # Workflow
+1. Use the Splunk MCP tools available to pull the requested findings.
+2. Score every finding against the rubric below.
+3. Emit the final ranked list as your LAST message — do not interleave the
+   ranking with tool calls.
 
-1. Use the Splunk MCP tools available to you to pull the findings. Run the
-   provided search (or a more targeted variant if the user specifies one)
-   and gather enough metadata about each finding to score it. If a finding
-   references an asset, user, or IOC and a tool exists to enrich it, you
-   may pull a small amount of additional context — but do not go on long
-   enrichment expeditions; the goal is triage, not investigation.
+# Scoring rubric (each factor 0-5)
+- Severity / CVSS         (weight 0.25) — Critical / 9.0+ = 5
+- Exploitability          (weight 0.20) — KEV-listed, public PoC, ITW = 5
+- Asset criticality       (weight 0.20) — crown-jewel / prod / sensitive = 5
+- Blast radius            (weight 0.15) — many hosts/users, lateral risk = 5
+- Recency                 (weight 0.10) — first seen <1h, still active = 5
+- Detection confidence    (weight 0.10) — low FP, correlated, named TTP = 5
 
-2. Score every finding against the rubric below. Each factor is scored
-   0-5 and combined into a single priority bucket (P0..P4).
+weighted_score = sum(score * weight). Bucket:
+- P0 >= 4.2: page on-call
+- P1 >= 3.4: same-day
+- P2 >= 2.6: this week
+- P3 >= 1.5: backlog
+- P4 <  1.5: likely FP / informational
 
-3. Produce the final ranked list as the LAST message. Do not interleave
-   the ranking with tool calls.
-
-# Scoring rubric (per finding)
-
-| Factor                  | Weight | What "5" looks like                                       |
-|-------------------------|--------|-----------------------------------------------------------|
-| Severity / CVSS         | 0.25   | Critical / CVSS 9.0+, or labelled severity=critical       |
-| Exploitability          | 0.20   | Public PoC, in-the-wild exploitation, KEV-listed CVE       |
-| Asset criticality       | 0.20   | Crown-jewel system: prod, internet-facing, sensitive data  |
-| Blast radius            | 0.15   | Many hosts/users affected, or lateral movement potential   |
-| Recency / freshness     | 0.10   | First seen <1h ago and still active                        |
-| Detection confidence    | 0.10   | Low FP rate, multiple correlated signals, named TTP        |
-
-Compute weighted_score = sum(factor_score * weight). Map to bucket:
-
-- P0  (>= 4.2): Page on-call. Active, high-confidence, high-impact.
-- P1  (>= 3.4): Same-day investigation. High risk but not actively burning.
-- P2  (>= 2.6): This-week queue. Real but not urgent.
-- P3  (>= 1.5): Backlog / hardening. Low confidence or low impact.
-- P4  (< 1.5):  Likely false positive or informational.
-
-# Heuristics & gotchas
-
-- Treat any finding mapped to MITRE ATT&CK techniques in initial-access,
-  credential-access, or lateral-movement tactics with extra weight.
-- If two findings share a host, user, or src_ip and arrived within ~30
-  minutes, group them into one incident — score the incident, not the
-  individual events.
-- If a finding's only signal is a single low-fidelity rule (e.g. generic
-  threat-intel match, isolated AV detection), default to P3 unless the
-  affected asset is crown-jewel.
-- If you cannot determine a factor from the data available, mark it
-  "unknown" and assume the median (2.5) — do NOT inflate the score to
-  hedge.
+Heuristic: group findings sharing host/user/src_ip within ~30 minutes into
+one incident. If a factor is unknown, assume the median (2.5) — do NOT
+inflate to hedge.
 
 # Output format
-
-Emit one JSON object per finding inside a fenced ```json block, in
-ranked order, plus a short executive summary above it. Schema:
+A short executive summary, then a ```json fenced block with one object per
+finding in ranked order:
 
 ```json
 [
@@ -89,161 +66,119 @@ ranked order, plus a short executive summary above it. Schema:
     "rank": 1,
     "priority": "P0",
     "weighted_score": 4.55,
-    "finding_id": "<splunk event id or rule_id>",
-    "title": "<short title>",
-    "asset": "<host / user / ip>",
-    "first_seen": "<iso8601>",
-    "scores": {
-      "severity": 5, "exploitability": 5, "asset_criticality": 4,
-      "blast_radius": 4, "recency": 5, "confidence": 4
-    },
-    "rationale": "<2-3 sentences: what is happening and why this rank>",
-    "recommended_action": "<one concrete next step>"
+    "finding_id": "...",
+    "title": "...",
+    "asset": "...",
+    "first_seen": "...",
+    "scores": {"severity": 5, "exploitability": 5, "asset_criticality": 4,
+               "blast_radius": 4, "recency": 5, "confidence": 4},
+    "rationale": "2-3 sentences",
+    "recommended_action": "one concrete next step"
   }
 ]
 ```
 """
 
 
-def _load_stdio_params() -> StdioServerParameters:
-    command = os.environ.get("SPLUNK_MCP_COMMAND")
-    if not command:
-        raise SystemExit(
-            "SPLUNK_MCP_COMMAND is required for stdio transport. "
-            "Set it to the binary that launches your Splunk MCP server "
-            "(e.g. 'uvx', 'npx', or an absolute path)."
-        )
-    args_raw = os.environ.get("SPLUNK_MCP_ARGS", "")
-    args = shlex.split(args_raw) if args_raw else []
+def ask_prompt() -> str | None:
+    """Show a Tkinter popup asking the user what to prioritize."""
+    result: dict[str, str | None] = {"text": None}
 
-    # Forward Splunk credentials to the MCP subprocess. The Splunk MCP
-    # server reads these from its own environment.
-    forwarded = {
-        k: v
-        for k, v in os.environ.items()
-        if k.startswith("SPLUNK_") and k not in {"SPLUNK_MCP_COMMAND", "SPLUNK_MCP_ARGS", "SPLUNK_MCP_TRANSPORT", "SPLUNK_MCP_URL", "SPLUNK_MCP_AUTH_HEADER"}
-    }
-    return StdioServerParameters(command=command, args=args, env=forwarded)
+    root = tk.Tk()
+    root.title("Splunk Findings Prioritization")
+    root.geometry("520x320")
 
+    tk.Label(
+        root,
+        text="What findings should I pull from Splunk and prioritize?",
+        anchor="w",
+    ).pack(fill=tk.X, padx=10, pady=(10, 4))
 
-@asynccontextmanager
-async def open_splunk_session() -> AsyncIterator[ClientSession]:
-    """Open a connected MCP ClientSession to the Splunk MCP server."""
-    transport = os.environ.get("SPLUNK_MCP_TRANSPORT", "stdio").lower()
+    text = scrolledtext.ScrolledText(root, height=10, wrap=tk.WORD)
+    text.pack(padx=10, pady=4, fill=tk.BOTH, expand=True)
+    text.insert("1.0", "Pull notable events from the last 24 hours and rank by risk.")
+    text.focus()
 
-    if transport == "stdio":
-        params = _load_stdio_params()
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                yield session
-        return
+    def submit() -> None:
+        result["text"] = text.get("1.0", tk.END).strip()
+        root.destroy()
 
-    if transport == "sse":
-        url = os.environ.get("SPLUNK_MCP_URL")
-        if not url:
-            raise SystemExit("SPLUNK_MCP_URL is required for sse transport.")
-        headers: dict[str, str] = {}
-        auth = os.environ.get("SPLUNK_MCP_AUTH_HEADER")
-        if auth:
-            headers["Authorization"] = auth
-        async with sse_client(url, headers=headers or None) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                yield session
-        return
+    def cancel() -> None:
+        root.destroy()
 
-    raise SystemExit(
-        f"Unknown SPLUNK_MCP_TRANSPORT={transport!r}. Use 'stdio' or 'sse'."
-    )
+    btns = tk.Frame(root)
+    btns.pack(pady=8)
+    tk.Button(btns, text="Run", command=submit, width=10).pack(side=tk.LEFT, padx=4)
+    tk.Button(btns, text="Cancel", command=cancel, width=10).pack(side=tk.LEFT, padx=4)
+    root.protocol("WM_DELETE_WINDOW", cancel)
+    root.mainloop()
+
+    return result["text"]
 
 
-def _format_block(block) -> str | None:
-    """Render a content block from the Claude response for the console."""
+def render_block(block) -> None:
+    """Stream Claude's content blocks to stdout as they arrive."""
     if block.type == "text":
-        return block.text
-    if block.type == "tool_use":
+        print(block.text, end="", flush=True)
+    elif block.type == "tool_use":
         try:
             args = json.dumps(block.input, sort_keys=True)
         except (TypeError, ValueError):
             args = str(block.input)
         if len(args) > 200:
             args = args[:200] + "…"
-        return f"\n[tool] {block.name}({args})"
-    return None
+        print(f"\n[tool] {block.name}({args})", flush=True)
 
 
-async def prioritize(user_prompt: str) -> None:
+async def run(user_prompt: str) -> None:
+    headers = {"Authorization": f"Bearer {SPLUNK_TOKEN}"}
     client = AsyncAnthropic()
 
-    async with open_splunk_session() as mcp:
-        tools_result = await mcp.list_tools()
-        tools = [async_mcp_tool(t, mcp) for t in tools_result.tools]
-        if not tools:
-            raise SystemExit(
-                "Splunk MCP server exposed no tools. Check the server is "
-                "running and configured against a reachable Splunk instance."
-            )
-        sys.stderr.write(
-            f"Connected to Splunk MCP server. {len(tools)} tools available: "
-            f"{', '.join(t.name for t in tools_result.tools)}\n"
-        )
+    async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
+        async with ClientSession(read, write) as mcp:
+            await mcp.initialize()
+            tools_result = await mcp.list_tools()
+            tools = [async_mcp_tool(t, mcp) for t in tools_result.tools]
+            if not tools:
+                sys.exit("Splunk MCP server exposed no tools — check the URL and token.")
 
-        runner = client.beta.messages.tool_runner(
-            model="claude-opus-4-7",
-            max_tokens=16000,
-            system=[
-                {
+            sys.stderr.write(
+                f"Connected. {len(tools)} Splunk tools available: "
+                f"{', '.join(t.name for t in tools_result.tools)}\n\n"
+            )
+
+            runner = client.beta.messages.tool_runner(
+                model="claude-opus-4-7",
+                max_tokens=16000,
+                system=[{
                     "type": "text",
                     "text": PRIORITIZATION_RUBRIC,
                     "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            thinking={"type": "adaptive"},
-            output_config={"effort": "high"},
-            tools=tools,
-            messages=[{"role": "user", "content": user_prompt}],
-            max_iterations=20,
-        )
+                }],
+                thinking={"type": "adaptive"},
+                output_config={"effort": "high"},
+                tools=tools,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_iterations=20,
+            )
 
-        async for message in runner:
-            for block in message.content:
-                rendered = _format_block(block)
-                if rendered:
-                    print(rendered, end="", flush=True)
-        print()
-
-
-def _build_user_prompt() -> str:
-    search = os.environ.get(
-        "SPLUNK_FINDINGS_SEARCH",
-        "search index=notable earliest=-24h | head 50",
-    )
-    max_findings = os.environ.get("MAX_FINDINGS", "50")
-    return (
-        "Pull the latest security findings from Splunk and prioritize them.\n\n"
-        f"Use this Splunk search as the primary source: `{search}`\n"
-        f"Cap the analysis at {max_findings} findings — if more come back, "
-        "rank by severity and score the top N.\n\n"
-        "Follow the rubric in your system prompt. Emit the final ranked "
-        "list as the last message, in the JSON schema specified."
-    )
+            async for message in runner:
+                for block in message.content:
+                    render_block(block)
+            print()
 
 
 def main() -> None:
-    load_dotenv()
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "prompt",
-        nargs="?",
-        default=None,
-        help="Optional override for the user prompt. Defaults to a prompt "
-        "built from SPLUNK_FINDINGS_SEARCH / MAX_FINDINGS env vars.",
-    )
-    args = parser.parse_args()
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        sys.exit("ANTHROPIC_API_KEY environment variable is not set.")
+    if "your-splunk-token-here" in SPLUNK_TOKEN or "your-splunk-mcp-server" in MCP_SERVER_URL:
+        sys.exit("Edit MCP_SERVER_URL and SPLUNK_TOKEN at the top of agent.py first.")
 
-    user_prompt = args.prompt or _build_user_prompt()
-    asyncio.run(prioritize(user_prompt))
+    prompt = ask_prompt()
+    if not prompt:
+        sys.exit("No prompt provided — cancelled.")
+
+    asyncio.run(run(prompt))
 
 
 if __name__ == "__main__":
