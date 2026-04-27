@@ -1,16 +1,21 @@
-"""Splunk findings prioritization agent — simple version.
+"""Splunk findings prioritization agent.
 
 How it works:
-1. Set MCP_SERVER_URL and SPLUNK_TOKEN below.
-2. Run `python agent.py`. A popup asks what you want to prioritize.
-3. Claude connects to the Splunk MCP server, pulls findings via its tools,
-   and prints a ranked priority list to the terminal.
+1. Set SPLUNK_MCP_URL and SPLUNK_TOKEN below.
+2. Run `python agent.py`. A popup asks for the Splunk search to run.
+3. Claude connects to the Splunk MCP server through the `mcp-remote` bridge
+   (an `npx` subprocess that proxies the remote HTTPS MCP endpoint over
+   stdio), runs the search via Splunk's MCP tools, and prints a ranked
+   priority list to the terminal.
+
+Requires Node.js / npm on PATH so `npx` can launch `mcp-remote`. No
+global install needed — `-y` lets npx fetch and run it on demand.
 """
 
 # ============================================================================
 # CONFIG — edit these two values
 # ============================================================================
-MCP_SERVER_URL = "https://your-splunk-mcp-server.example.com/sse"
+SPLUNK_MCP_URL = "https://ec2-98-84-5-114.compute-1.amazonaws.com:8089/services/mcp"
 SPLUNK_TOKEN = "your-splunk-token-here"
 # ============================================================================
 
@@ -24,16 +29,16 @@ from tkinter import scrolledtext
 from anthropic import AsyncAnthropic
 from anthropic.lib.tools.mcp import async_mcp_tool
 from mcp import ClientSession
-from mcp.client.sse import sse_client
+from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
 PRIORITIZATION_RUBRIC = """\
 You are a senior detection-engineering analyst. Triage the security findings
-the user asks about and produce a ranked priority list.
+returned by the user's Splunk search and produce a ranked priority list.
 
 # Workflow
-1. Use the Splunk MCP tools available to pull the requested findings.
-2. Score every finding against the rubric below.
+1. Use the Splunk MCP tools available to execute the user's SPL search.
+2. Score every finding the search returns against the rubric below.
 3. Emit the final ranked list as your LAST message — do not interleave the
    ranking with tool calls.
 
@@ -80,23 +85,25 @@ finding in ranked order:
 """
 
 
-def ask_prompt() -> str | None:
-    """Show a Tkinter popup asking the user what to prioritize."""
+def ask_search() -> str | None:
+    """Show a Tkinter popup asking for the Splunk search (SPL) to run."""
     result: dict[str, str | None] = {"text": None}
 
     root = tk.Tk()
-    root.title("Splunk Findings Prioritization")
-    root.geometry("520x320")
+    root.title("Splunk Findings — Search")
+    root.geometry("560x320")
 
     tk.Label(
         root,
-        text="What findings should I pull from Splunk and prioritize?",
+        text="Enter the Splunk search (SPL) to run.\n"
+             "The agent will execute it and prioritize the results.",
         anchor="w",
+        justify="left",
     ).pack(fill=tk.X, padx=10, pady=(10, 4))
 
-    text = scrolledtext.ScrolledText(root, height=10, wrap=tk.WORD)
+    text = scrolledtext.ScrolledText(root, height=10, wrap=tk.WORD, font=("Courier", 10))
     text.pack(padx=10, pady=4, fill=tk.BOTH, expand=True)
-    text.insert("1.0", "Pull notable events from the last 24 hours and rank by risk.")
+    text.insert("1.0", "search index=notable earliest=-24h | head 50")
     text.focus()
 
     def submit() -> None:
@@ -130,17 +137,40 @@ def render_block(block) -> None:
         print(f"\n[tool] {block.name}({args})", flush=True)
 
 
-async def run(user_prompt: str) -> None:
-    headers = {"Authorization": f"Bearer {SPLUNK_TOKEN}"}
-    client = AsyncAnthropic()
+async def run(splunk_search: str) -> None:
+    user_prompt = (
+        "Run this Splunk search and prioritize every finding it returns:\n\n"
+        f"```\n{splunk_search}\n```\n\n"
+        "Use the Splunk MCP tools available to execute the search. Then "
+        "score every finding against the rubric in your system prompt and "
+        "emit the final ranked JSON list as your last message."
+    )
 
-    async with sse_client(MCP_SERVER_URL, headers=headers) as (read, write):
+    # Launches: npx -y mcp-remote <URL> --header "Authorization: Bearer <TOKEN>"
+    # mcp-remote proxies the remote HTTPS MCP endpoint over stdio.
+    params = StdioServerParameters(
+        command="npx",
+        args=[
+            "-y",
+            "mcp-remote",
+            SPLUNK_MCP_URL,
+            "--header",
+            f"Authorization: Bearer {SPLUNK_TOKEN}",
+        ],
+        # Splunk on EC2 typically uses a self-signed cert. mcp-remote runs on
+        # Node, so we disable Node's TLS verification for this subprocess.
+        # Remove this line if your Splunk uses a CA-signed cert.
+        env={**os.environ, "NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+    )
+
+    client = AsyncAnthropic()
+    async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as mcp:
             await mcp.initialize()
             tools_result = await mcp.list_tools()
             tools = [async_mcp_tool(t, mcp) for t in tools_result.tools]
             if not tools:
-                sys.exit("Splunk MCP server exposed no tools — check the URL and token.")
+                sys.exit("Splunk MCP server exposed no tools — check URL and token.")
 
             sys.stderr.write(
                 f"Connected. {len(tools)} Splunk tools available: "
@@ -171,14 +201,14 @@ async def run(user_prompt: str) -> None:
 def main() -> None:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("ANTHROPIC_API_KEY environment variable is not set.")
-    if "your-splunk-token-here" in SPLUNK_TOKEN or "your-splunk-mcp-server" in MCP_SERVER_URL:
-        sys.exit("Edit MCP_SERVER_URL and SPLUNK_TOKEN at the top of agent.py first.")
+    if "your-splunk-token-here" in SPLUNK_TOKEN:
+        sys.exit("Edit SPLUNK_TOKEN at the top of agent.py first.")
 
-    prompt = ask_prompt()
-    if not prompt:
-        sys.exit("No prompt provided — cancelled.")
+    search = ask_search()
+    if not search:
+        sys.exit("No search provided — cancelled.")
 
-    asyncio.run(run(prompt))
+    asyncio.run(run(search))
 
 
 if __name__ == "__main__":
