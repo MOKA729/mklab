@@ -30,6 +30,8 @@ import json
 import os
 import sys
 
+import certifi
+import httpx
 from anthropic import AsyncAnthropic
 from anthropic.lib.tools.mcp import async_mcp_tool
 from mcp import ClientSession
@@ -191,7 +193,13 @@ async def run() -> None:
         env=subprocess_env,
     )
 
-    client = AsyncAnthropic()
+    # macOS + pyenv Pythons don't see the system trust store, so httpx
+    # raises CERTIFICATE_VERIFY_FAILED when calling api.anthropic.com.
+    # Pinning the certifi CA bundle into the AsyncAnthropic client fixes
+    # this regardless of shell env / SSL_CERT_FILE.
+    client = AsyncAnthropic(
+        http_client=httpx.AsyncClient(verify=certifi.where()),
+    )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as mcp:
             await mcp.initialize()
