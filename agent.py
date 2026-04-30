@@ -14,10 +14,15 @@ global install needed — `-y` lets npx fetch and run it on demand.
 """
 
 # ============================================================================
-# CONFIG — edit these two values
+# CONFIG — edit these values
 # ============================================================================
 SPLUNK_MCP_URL = "https://ec2-98-84-5-114.compute-1.amazonaws.com:8089/services/mcp"
 SPLUNK_TOKEN = "your-splunk-token-here"
+
+# Set True to skip TLS verification on the MCP connection. Required when
+# Splunk uses a self-signed cert (typical on EC2). Set False in production
+# with a CA-signed cert.
+IGNORE_SSL = True
 # ============================================================================
 
 import asyncio
@@ -169,6 +174,11 @@ def render_block(block) -> None:
 async def run() -> None:
     # Launches: npx -y mcp-remote <URL> --header "Authorization: Bearer <TOKEN>"
     # mcp-remote proxies the remote HTTPS MCP endpoint over stdio.
+    subprocess_env = {**os.environ}
+    if IGNORE_SSL:
+        # Disable Node's TLS verification for the mcp-remote subprocess.
+        subprocess_env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
+
     params = StdioServerParameters(
         command="npx",
         args=[
@@ -178,10 +188,7 @@ async def run() -> None:
             "--header",
             f"Authorization: Bearer {SPLUNK_TOKEN}",
         ],
-        # Splunk on EC2 typically uses a self-signed cert. mcp-remote runs
-        # on Node, so we disable Node's TLS verification for this
-        # subprocess. Remove this line if your Splunk uses a CA-signed cert.
-        env={**os.environ, "NODE_TLS_REJECT_UNAUTHORIZED": "0"},
+        env=subprocess_env,
     )
 
     client = AsyncAnthropic()
