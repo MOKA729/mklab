@@ -47,8 +47,8 @@ notable in Incident Review.
 # Workflow
 1. Use the Splunk MCP tools available to pull every notable event from the
    `notable` index (or the equivalent index/datamodel this Splunk uses for
-   findings/alerts). Pull the most recent batch — default to the last 24
-   hours, but if the search returns nothing, widen the window.
+   findings/alerts). Pull the most recent batch — default to the last 30
+   days, but if the search returns nothing, widen the window.
 2. Score every finding against the rubric below.
 3. Write the classification BACK to Splunk (see the write-back section).
 4. Print a final summary to the terminal: how many findings were
