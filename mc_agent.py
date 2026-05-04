@@ -63,12 +63,15 @@ severity, urgency, status, assignee, created_at, and additional metadata.
    one incident — score the incident, not individual events.
 3. Output the CSV deliverable described below.
 
-# CRITICAL: id handling
+# CRITICAL: source_event_id handling
 
-Use the investigation's `id` field (or `display_id` if `id` is missing) as
-the row's `id` in the CSV. Use the EXACT value as it appears in the input
-JSON — do NOT synthesize, shorten, or reformat. The `id` is used as a
-path parameter when writing back via the Mission Control API.
+Each investigation has a `source_event_id` field that identifies the
+underlying notable event. This is the value the Mission Control notes API
+expects as a path parameter. Use the EXACT value as it appears in the input
+JSON — do NOT synthesize, shorten, or reformat.
+
+If an investigation has no `source_event_id`, fall back to `id`. If both
+are missing, SKIP that investigation (do not include it in the CSV).
 
 # Scoring rubric (each factor 0-5)
 
@@ -97,11 +100,11 @@ How many investigations classified, P0..P4 distribution, top 1-2 to act on.
 ## 2. CSV block — match this format EXACTLY:
 
 ```csv
-id,ai_priority,ai_score,ai_rationale,ai_recommended_action
-2a2d00e8-ac75-4207-bcbe-992e2049e42d,P0,4.75,"Brief rationale","One concrete next step"
+source_event_id,ai_priority,ai_score,ai_rationale,ai_recommended_action
+2a2d00e8-ac75-4207-bcbe-992e2049e42d@@notable@@time1777919948,P0,4.75,"Brief rationale","One concrete next step"
 ```
 
-Header MUST be exactly: id,ai_priority,ai_score,ai_rationale,ai_recommended_action
+Header MUST be exactly: source_event_id,ai_priority,ai_score,ai_rationale,ai_recommended_action
 Quote any field with commas/quotes (escape inner quotes by doubling).
 Rationale ≤120 chars, action ≤80 chars. One row per investigation.
 
@@ -217,20 +220,42 @@ async def post_note(
     return (resp.status_code, resp.text[:300])
 
 
+def _row_id(row: dict[str, str]) -> str:
+    """Pick the path-parameter value from a CSV row. Tries source_event_id
+    first (the field Mission Control expects), then event_id, then id."""
+    for key in ("source_event_id", "event_id", "id", "display_id"):
+        v = (row.get(key) or "").strip()
+        if v:
+            return v
+    return ""
+
+
 async def write_notes(rows: list[dict[str, str]]) -> None:
     if not rows:
         sys.stderr.write("[notes] No rows to write.\n")
         return
-    sys.stderr.write(f"[notes] Posting {len(rows)} notes to Mission Control...\n")
+
+    sys.stderr.write(
+        f"[notes] Posting {len(rows)} notes — one POST per source_event_id "
+        f"to {SPLUNK_BASE_URL}/servicesNS/nobody/missioncontrol/public/v2/"
+        "investigations/<source_event_id>/notes\n"
+    )
 
     success = 0
+    skipped = 0
     failures: list[tuple[str, int, str]] = []
 
     async with httpx.AsyncClient(verify=not IGNORE_SSL, timeout=30.0) as http:
-        for row in rows:
-            inv_id = (row.get("id") or "").strip()
+        for i, row in enumerate(rows, 1):
+            inv_id = _row_id(row)
             if not inv_id:
+                sys.stderr.write(
+                    f"  [{i:>3}] SKIP — no source_event_id/event_id/id in row: "
+                    f"{list(row.keys())}\n"
+                )
+                skipped += 1
                 continue
+
             content = (
                 f"**Priority:** {row.get('ai_priority', '')}  \n"
                 f"**Score:** {row.get('ai_score', '')}  \n"
@@ -238,18 +263,22 @@ async def write_notes(rows: list[dict[str, str]]) -> None:
                 f"**Recommended action:** {row.get('ai_recommended_action', '')}"
             )
             status, body = await post_note(http, inv_id, content)
+
+            short_id = inv_id if len(inv_id) <= 60 else inv_id[:57] + "…"
             if 200 <= status < 300:
                 success += 1
+                sys.stderr.write(f"  [{i:>3}] OK   {status}  {short_id}\n")
             else:
                 failures.append((inv_id, status, body))
+                body_preview = body.replace("\n", " ")[:160]
+                sys.stderr.write(
+                    f"  [{i:>3}] FAIL {status}  {short_id}  → {body_preview}\n"
+                )
 
-    sys.stderr.write(f"[notes] {success}/{len(rows)} notes posted.\n")
-    if failures:
-        sys.stderr.write(f"[notes] {len(failures)} failed:\n")
-        for inv_id, status, body in failures[:5]:
-            sys.stderr.write(f"  - {inv_id}: HTTP {status} — {body}\n")
-        if len(failures) > 5:
-            sys.stderr.write(f"  ... and {len(failures) - 5} more.\n")
+    sys.stderr.write(
+        f"[notes] {success}/{len(rows)} posted "
+        f"({skipped} skipped, {len(failures)} failed).\n"
+    )
 
 
 async def run() -> None:
