@@ -49,6 +49,29 @@ WRITE_NOTES_VIA_API = True
 # a different host/port.
 SPLUNK_REST_URL = SPLUNK_MCP_URL.split("/services/")[0]
 
+# Auth for the Splunk REST API. The MCP token is often NOT a valid Splunk
+# auth token — MCP servers commonly use their own credential system and
+# translate to Splunk auth internally. If you get HTTP 401 "call not
+# properly authenticated", do one of these:
+#
+#   A. Generate a real Splunk auth token: Splunk Web → Settings → Tokens
+#      → New Token. The result is a JWT starting with "eyJ...". Set:
+#          SPLUNK_API_TOKEN = "eyJraWQiOi..."
+#          SPLUNK_API_AUTH_SCHEME = "Splunk"        # Splunk's native scheme
+#      (or "Bearer" — both work for tokens generated this way.)
+#
+#   B. Use basic auth with username/password:
+#          SPLUNK_API_TOKEN = ""
+#          SPLUNK_API_USERNAME = "admin"
+#          SPLUNK_API_PASSWORD = "your-password"
+#
+# By default we reuse SPLUNK_TOKEN with the "Splunk" scheme (more likely to
+# work for direct REST than "Bearer"). If that 401s, follow option A or B.
+SPLUNK_API_TOKEN = SPLUNK_TOKEN
+SPLUNK_API_AUTH_SCHEME = "Splunk"     # "Splunk" or "Bearer"
+SPLUNK_API_USERNAME = ""              # only used if SPLUNK_API_TOKEN is empty
+SPLUNK_API_PASSWORD = ""              # only used if SPLUNK_API_TOKEN is empty
+
 # Also overwrite each notable's urgency field to match the AI priority
 # (P0=critical, P1=high, P2=medium, P3=low, P4=informational). Default
 # False so we never clobber an analyst's existing urgency. Flip on if
@@ -203,12 +226,26 @@ _URGENCY_MAP = {
 }
 
 
+def _build_splunk_api_auth() -> tuple[dict[str, str], tuple[str, str] | None]:
+    """Return (headers, basic_auth_tuple) for the Splunk REST API call.
+    Exactly one of the two will be populated based on the config above."""
+    if SPLUNK_API_TOKEN:
+        scheme = SPLUNK_API_AUTH_SCHEME or "Splunk"
+        return {"Authorization": f"{scheme} {SPLUNK_API_TOKEN}"}, None
+    if SPLUNK_API_USERNAME and SPLUNK_API_PASSWORD:
+        return {}, (SPLUNK_API_USERNAME, SPLUNK_API_PASSWORD)
+    raise SystemExit(
+        "Splunk REST API auth not configured. Set SPLUNK_API_TOKEN "
+        "(preferred) or SPLUNK_API_USERNAME + SPLUNK_API_PASSWORD."
+    )
+
+
 async def write_notes_to_splunk(csv_path: str) -> None:
     """For each row in the classification CSV, POST a comment to Splunk's
     /services/notable_update endpoint so the AI triage shows up as a note
     on the corresponding notable event in Incident Review."""
 
-    rows = []
+    rows: list[dict[str, str]] = []
     with open(csv_path, encoding="utf-8") as f:
         reader = csv_module.DictReader(f)
         rows = list(reader)
@@ -216,15 +253,23 @@ async def write_notes_to_splunk(csv_path: str) -> None:
         sys.stderr.write("[notes] CSV had no rows; nothing to write back.\n")
         return
 
+    headers, basic_auth = _build_splunk_api_auth()
+    auth_label = (
+        "basic auth"
+        if basic_auth is not None
+        else f"{SPLUNK_API_AUTH_SCHEME} <token>"
+    )
     sys.stderr.write(
         f"[notes] Writing {len(rows)} comments to {SPLUNK_REST_URL} "
-        f"via POST /services/notable_update ...\n"
+        f"via POST /services/notable_update (auth: {auth_label}) ...\n"
     )
 
     success = 0
     failures: list[tuple[str, int, str]] = []
 
-    async with httpx.AsyncClient(verify=not IGNORE_SSL, timeout=30.0) as http:
+    async with httpx.AsyncClient(
+        verify=not IGNORE_SSL, timeout=30.0, auth=basic_auth
+    ) as http:
         for row in rows:
             event_id = (row.get("event_id") or "").strip()
             if not event_id:
@@ -252,7 +297,7 @@ async def write_notes_to_splunk(csv_path: str) -> None:
                 resp = await http.post(
                     f"{SPLUNK_REST_URL}/services/notable_update",
                     data=data,
-                    headers={"Authorization": f"Bearer {SPLUNK_TOKEN}"},
+                    headers=headers,
                 )
             except httpx.HTTPError as exc:
                 failures.append((event_id, 0, repr(exc)))
@@ -266,10 +311,22 @@ async def write_notes_to_splunk(csv_path: str) -> None:
     sys.stderr.write(f"[notes] {success}/{len(rows)} notable comments written.\n")
     if failures:
         sys.stderr.write(f"[notes] {len(failures)} failed:\n")
-        for event_id, status, body in failures[:5]:
+        for event_id, status, body in failures[:3]:
             sys.stderr.write(f"  - {event_id}: HTTP {status} — {body}\n")
-        if len(failures) > 5:
-            sys.stderr.write(f"  ... and {len(failures) - 5} more.\n")
+        if len(failures) > 3:
+            sys.stderr.write(f"  ... and {len(failures) - 3} more.\n")
+        if all(s == 401 for _, s, _ in failures):
+            sys.stderr.write(
+                "\n[notes] All requests returned 401. Your token does not "
+                "authenticate against the Splunk REST API directly. Fix:\n"
+                "  1. Generate a Splunk auth token: Splunk Web → Settings → "
+                "Tokens → New Token. The result starts with 'eyJ...'.\n"
+                "  2. Set SPLUNK_API_TOKEN to that JWT at the top of agent.py.\n"
+                "  3. Try SPLUNK_API_AUTH_SCHEME = 'Splunk' first; if that "
+                "still 401s, switch to 'Bearer'.\n"
+                "  4. As a fallback, use basic auth (SPLUNK_API_USERNAME + "
+                "SPLUNK_API_PASSWORD) and clear SPLUNK_API_TOKEN.\n"
+            )
 
 
 async def run() -> None:
