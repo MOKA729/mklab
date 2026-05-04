@@ -162,15 +162,24 @@ USER_PROMPT = (
 def render_block(block) -> None:
     """Stream Claude's content blocks to stdout as they arrive."""
     if block.type == "text":
-        print(block.text, end="", flush=True)
+        if block.text:
+            print(block.text, end="", flush=True)
     elif block.type == "tool_use":
         try:
             args = json.dumps(block.input, sort_keys=True)
         except (TypeError, ValueError):
             args = str(block.input)
-        if len(args) > 200:
-            args = args[:200] + "…"
+        if len(args) > 300:
+            args = args[:300] + "…"
         print(f"\n[tool] {block.name}({args})", flush=True)
+    elif block.type == "thinking":
+        # Surface thinking summaries so we can see *why* Claude stopped.
+        text = getattr(block, "thinking", "") or ""
+        if text.strip():
+            preview = text[:400] + ("…" if len(text) > 400 else "")
+            print(f"\n[thinking] {preview}", flush=True)
+    else:
+        print(f"\n[{block.type}]", flush=True)
 
 
 async def run() -> None:
@@ -221,17 +230,29 @@ async def run() -> None:
                     "text": PRIORITIZATION_RUBRIC,
                     "cache_control": {"type": "ephemeral"},
                 }],
-                thinking={"type": "adaptive"},
+                thinking={"type": "adaptive", "display": "summarized"},
                 output_config={"effort": "high"},
                 tools=tools,
                 messages=[{"role": "user", "content": USER_PROMPT}],
                 max_iterations=40,
             )
 
-            async for message in runner:
-                for block in message.content:
-                    render_block(block)
-            print()
+            iteration = 0
+            try:
+                async for message in runner:
+                    iteration += 1
+                    for block in message.content:
+                        render_block(block)
+                    stop = getattr(message, "stop_reason", None)
+                    sys.stderr.write(
+                        f"\n[iter {iteration}] stop_reason={stop} "
+                        f"in={message.usage.input_tokens} "
+                        f"out={message.usage.output_tokens}\n"
+                    )
+            except Exception as exc:
+                sys.stderr.write(f"\n[error] runner raised: {exc!r}\n")
+                raise
+            print(f"\n[done] {iteration} iterations.")
 
 
 def main() -> None:
