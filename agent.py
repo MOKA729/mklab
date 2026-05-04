@@ -2,12 +2,11 @@
 
 How it works:
 1. Set SPLUNK_MCP_URL and SPLUNK_TOKEN below.
-2. Run `python agent.py`. No prompt — the agent runs autonomously.
-3. The agent connects to the Splunk MCP server through the `mcp-remote`
-   bridge, pulls every notable event, scores each one against the
-   prioritization rubric, and writes the classification back to Splunk
-   so the priority/score show up alongside each notable in Incident
-   Review (or whichever findings page your Splunk surfaces).
+2. Run `python agent.py`. No prompt — runs autonomously.
+3. The agent pulls notable events via the Splunk MCP server, scores each
+   one against the prioritization rubric, and writes a CSV file
+   (findings_classification.csv) that you upload to Splunk as a lookup
+   table to display the priority/score columns alongside each notable.
 
 Requires Node.js / npm on PATH so `npx` can launch `mcp-remote`. No
 global install needed — `-y` lets npx fetch and run it on demand.
@@ -23,11 +22,27 @@ SPLUNK_TOKEN = "your-splunk-token-here"
 # Splunk uses a self-signed cert (typical on EC2). Set False in production
 # with a CA-signed cert.
 IGNORE_SSL = True
+
+# Model to use. Opus 4.7 gives the best prioritization quality but is
+# expensive and rate-limited on lower Anthropic tiers (30K input tokens/min).
+# Sonnet 4.6 is ~5x cheaper, less rate-limited, and good enough for most
+# triage. Haiku 4.5 is the cheapest but quality drops on borderline cases.
+MODEL = "claude-opus-4-7"
+# MODEL = "claude-sonnet-4-6"
+# MODEL = "claude-haiku-4-5"
+
+# Cap on how many findings Claude analyzes in one run. Keeps token use
+# under control. Increase if you've raised your rate limit.
+MAX_FINDINGS = 50
+
+# Where to write the classification CSV that you'll upload to Splunk.
+OUTPUT_CSV = "findings_classification.csv"
 # ============================================================================
 
 import asyncio
 import json
 import os
+import re
 import sys
 
 import certifi
@@ -39,123 +54,91 @@ from mcp.client.stdio import StdioServerParameters, stdio_client
 
 
 PRIORITIZATION_RUBRIC = """\
-You are a senior detection-engineering analyst. Triage every notable event
-in the Splunk notable index, score it against the rubric, and write the
-classification back to Splunk so it appears as columns alongside each
-notable in Incident Review.
+You are a security findings prioritization agent. Be CONCISE — every token
+you emit costs money and the user's account is rate-limited.
 
 # Workflow
-1. Use the Splunk MCP tools available to pull every notable event from the
-   `notable` index (or the equivalent index/datamodel this Splunk uses for
-   findings/alerts). Pull the most recent batch — default to the last 30
-   days, but if the search returns nothing, widen the window.
+
+1. Run ONE Splunk search to pull the most recent notable events:
+   `search index=notable earliest=-30d | head 50 | table _time event_id rule_name severity urgency src dest user signature`
+   Adjust the time window only if zero results come back.
 2. Score every finding against the rubric below.
-3. Write the classification BACK to Splunk (see the write-back section).
-4. Print a final summary to the terminal: how many findings were
-   classified, where the data was written, and the SPL the user should
-   add to their notable search to display the new columns.
+3. Group findings sharing host/user/src_ip within ~30 minutes into one
+   incident — score the incident, not the individual events.
+4. Output the deliverable (see OUTPUT below).
+
+# DO NOT attempt to write back to Splunk
+
+This MCP server BLOCKS every SPL write command — `outputlookup`, `collect`,
+`outputcsv`, `summaryindex`, `mcollect`, `meventcollect`, `sendalert` are
+all forbidden. Don't waste iterations trying. Don't list saved searches.
+Don't probe the kv_store. Just pull, score, and emit the CSV. The user
+uploads it to Splunk manually.
 
 # Scoring rubric (each factor 0-5)
-- Severity / CVSS         (weight 0.25) — Critical / 9.0+ = 5
-- Exploitability          (weight 0.20) — KEV-listed, public PoC, ITW = 5
-- Asset criticality       (weight 0.20) — crown-jewel / prod / sensitive = 5
-- Blast radius            (weight 0.15) — many hosts/users, lateral risk = 5
-- Recency                 (weight 0.10) — first seen <1h, still active = 5
-- Detection confidence    (weight 0.10) — low FP, correlated, named TTP = 5
+
+| Factor             | Weight | "5" looks like                              |
+|--------------------|--------|---------------------------------------------|
+| Severity           | 0.25   | severity=critical or CVSS 9.0+              |
+| Exploitability     | 0.20   | KEV-listed, public PoC, in-the-wild         |
+| Asset criticality  | 0.20   | crown-jewel: prod, internet-facing, sens.   |
+| Blast radius       | 0.15   | many hosts/users, lateral movement risk     |
+| Recency            | 0.10   | first seen <1h ago, still active            |
+| Confidence         | 0.10   | low FP rate, correlated, named TTP          |
 
 weighted_score = sum(score * weight). Bucket:
-- P0 >= 4.2: page on-call          (urgency=critical)
-- P1 >= 3.4: same-day              (urgency=high)
-- P2 >= 2.6: this week             (urgency=medium)
-- P3 >= 1.5: backlog               (urgency=low)
-- P4 <  1.5: likely FP / informational (urgency=informational)
+- P0 >= 4.2 — page on-call
+- P1 >= 3.4 — same-day
+- P2 >= 2.6 — this week
+- P3 >= 1.5 — backlog
+- P4 <  1.5 — likely FP / informational
 
-If a factor is unknown, assume the median (2.5) — do NOT inflate to hedge.
+If a factor is unknown, use 2.5 (median). Do NOT inflate to hedge.
 
-# Write-back to Splunk
-For each scored notable, write these fields back, keyed by the notable's
-`event_id` (or `_cd` / `rule_id` if no event_id is present):
+# OUTPUT — these three sections, in order, as your final message
 
-- ai_priority         (P0..P4)
-- ai_score            (float, 2 decimals)
-- ai_rationale        (1-2 sentence string)
-- ai_recommended_action (short string)
+## 1. Executive summary (3-5 lines max)
 
-Pick the FIRST of these strategies that the available MCP tools support —
-in order of preference, since each maps cleanly to columns in Incident
-Review:
+How many findings classified, the P0..P4 distribution, and the top 1-2
+items needing attention.
 
-  1. **Notable update** — if a tool exists to update a notable event
-     (e.g. `update_notable`, `notable_update`, or anything that sets
-     urgency/comment/custom fields on a notable by event_id), use it.
-     Map ai_priority to the `urgency` field per the rubric, and put
-     ai_score + ai_rationale into the comment.
+## 2. CSV block (this is parsed and written to disk — match the format exactly)
 
-  2. **KV store / lookup write** — if a tool exists to write to a KV store
-     collection or CSV lookup, write one row per finding to a collection
-     named `claude_findings_classification` with the four fields above
-     plus `event_id`.
-
-  3. **Index a summary event** — if neither of the above is available,
-     index a new event per finding to index `claude_classifications`
-     (sourcetype `ai:findings:classification`) containing all four fields
-     plus event_id.
-
-After writing, print:
-
-- How many findings you classified and how many you successfully wrote back.
-- Which strategy you used (1, 2, or 3 above).
-- The exact SPL the user should append to their notable search to display
-  the new columns. Concrete examples:
-
-  Strategy 2 (KV lookup):
-      | lookup claude_findings_classification event_id OUTPUT
-        ai_priority ai_score ai_rationale ai_recommended_action
-
-  Strategy 3 (summary index):
-      | join type=left event_id [ search index=claude_classifications
-        | dedup event_id sortby -_time
-        | fields event_id ai_priority ai_score ai_rationale
-                 ai_recommended_action ]
-
-# Output format
-
-Stream tool calls as you go — that's normal. As your final message, emit:
-
-1. A short executive summary (3-5 lines): how many notables, distribution
-   across P0..P4 buckets, top 1-2 things needing attention.
-2. The write-back confirmation and the exact SPL to add to the notable
-   search.
-3. A ```json fenced block with one object per finding in ranked order:
-
-```json
-[
-  {
-    "rank": 1,
-    "priority": "P0",
-    "weighted_score": 4.55,
-    "event_id": "...",
-    "title": "...",
-    "asset": "...",
-    "first_seen": "...",
-    "scores": {"severity": 5, "exploitability": 5, "asset_criticality": 4,
-               "blast_radius": 4, "recency": 5, "confidence": 4},
-    "rationale": "2-3 sentences",
-    "recommended_action": "one concrete next step"
-  }
-]
+```csv
+event_id,ai_priority,ai_score,ai_rationale,ai_recommended_action
+NE-20260430-001,P0,4.75,"Brief 1-line rationale","One concrete next step"
+...
 ```
+
+Rules for the CSV:
+- Header MUST be exactly: event_id,ai_priority,ai_score,ai_rationale,ai_recommended_action
+- Quote any field containing a comma or quote (escape inner quotes by doubling them).
+- One row per finding (or per incident if you grouped). Cap rationale at ~120 chars
+  and action at ~80 chars.
+
+## 3. Splunk lookup setup instructions
+
+Print these literal steps so the user knows what to do with the CSV:
+
+   a) Splunk Web → Settings → Lookups → Lookup table files → Add new
+   b) Upload findings_classification.csv (destination app: search)
+   c) Settings → Lookups → Lookup definitions → Add new
+      Name: findings_classification, type: File-based, file: findings_classification.csv
+   d) Append to your Incident Review (or notable) search:
+      ```
+      | lookup findings_classification event_id OUTPUT ai_priority ai_score ai_rationale ai_recommended_action
+      ```
+
+Keep the entire final message under ~1500 tokens.
 """
 
 
 USER_PROMPT = (
-    "Pull every notable event from Splunk, classify each one against the "
-    "rubric in your system prompt, and write the classification back to "
-    "Splunk so the priority and score show up as columns on the notable "
-    "events / Incident Review page.\n\n"
-    "Discover what tools the Splunk MCP server exposes and pick the best "
-    "write-back path per the system prompt. End with a summary and the "
-    "exact SPL the user should add to their notable search."
+    f"Pull the {MAX_FINDINGS} most recent notable events from Splunk via "
+    "splunk_run_query, score each one against the rubric in your system "
+    "prompt, and emit the CSV + summary as specified. ONE pull-search at the "
+    "start, then score and write. Do NOT try to write back to Splunk via "
+    "MCP — this server blocks all write SPL."
 )
 
 
@@ -173,7 +156,6 @@ def render_block(block) -> None:
             args = args[:300] + "…"
         print(f"\n[tool] {block.name}({args})", flush=True)
     elif block.type == "thinking":
-        # Surface thinking summaries so we can see *why* Claude stopped.
         text = getattr(block, "thinking", "") or ""
         if text.strip():
             preview = text[:400] + ("…" if len(text) > 400 else "")
@@ -182,12 +164,21 @@ def render_block(block) -> None:
         print(f"\n[{block.type}]", flush=True)
 
 
+def extract_csv_to_file(full_text: str, path: str) -> bool:
+    """Pull the first ```csv ... ``` fenced block from the model output and
+    write it to `path`. Returns True on success."""
+    match = re.search(r"```csv\s*\n(.*?)\n```", full_text, re.DOTALL | re.IGNORECASE)
+    if not match:
+        return False
+    csv_text = match.group(1).strip() + "\n"
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(csv_text)
+    return True
+
+
 async def run() -> None:
-    # Launches: npx -y mcp-remote <URL> --header "Authorization: Bearer <TOKEN>"
-    # mcp-remote proxies the remote HTTPS MCP endpoint over stdio.
     subprocess_env = {**os.environ}
     if IGNORE_SSL:
-        # Disable Node's TLS verification for the mcp-remote subprocess.
         subprocess_env["NODE_TLS_REJECT_UNAUTHORIZED"] = "0"
 
     params = StdioServerParameters(
@@ -202,12 +193,8 @@ async def run() -> None:
         env=subprocess_env,
     )
 
-    # macOS + pyenv Pythons don't see the system trust store, so httpx
-    # raises CERTIFICATE_VERIFY_FAILED when calling api.anthropic.com.
-    # Pinning the certifi CA bundle into the AsyncAnthropic client fixes
-    # this regardless of shell env / SSL_CERT_FILE.
     client = AsyncAnthropic(
-        http_client=httpx.AsyncClient(verify=certifi.where()),
+        http_client=httpx.AsyncClient(verify=False),
     )
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as mcp:
@@ -218,31 +205,34 @@ async def run() -> None:
                 sys.exit("Splunk MCP server exposed no tools — check URL and token.")
 
             sys.stderr.write(
-                f"Connected. {len(tools)} Splunk tools available: "
-                f"{', '.join(t.name for t in tools_result.tools)}\n\n"
+                f"Connected. {len(tools)} Splunk tools available.\n"
+                f"Model: {MODEL}, max findings: {MAX_FINDINGS}\n\n"
             )
 
             runner = client.beta.messages.tool_runner(
-                model="claude-opus-4-7",
-                max_tokens=16000,
+                model=MODEL,
+                max_tokens=8000,
                 system=[{
                     "type": "text",
                     "text": PRIORITIZATION_RUBRIC,
                     "cache_control": {"type": "ephemeral"},
                 }],
                 thinking={"type": "adaptive", "display": "summarized"},
-                output_config={"effort": "high"},
+                output_config={"effort": "medium"},
                 tools=tools,
                 messages=[{"role": "user", "content": USER_PROMPT}],
-                max_iterations=40,
+                max_iterations=15,
             )
 
+            collected_text: list[str] = []
             iteration = 0
             try:
                 async for message in runner:
                     iteration += 1
                     for block in message.content:
                         render_block(block)
+                        if block.type == "text" and block.text:
+                            collected_text.append(block.text)
                     stop = getattr(message, "stop_reason", None)
                     sys.stderr.write(
                         f"\n[iter {iteration}] stop_reason={stop} "
@@ -251,8 +241,22 @@ async def run() -> None:
                     )
             except Exception as exc:
                 sys.stderr.write(f"\n[error] runner raised: {exc!r}\n")
-                raise
-            print(f"\n[done] {iteration} iterations.")
+                # Don't re-raise — try to extract whatever CSV we got so far.
+
+            print(f"\n\n[done] {iteration} iterations.")
+
+            full = "".join(collected_text)
+            if extract_csv_to_file(full, OUTPUT_CSV):
+                sys.stderr.write(
+                    f"[saved] Wrote classifications to {OUTPUT_CSV} — "
+                    "upload this file to Splunk as a lookup table per the "
+                    "instructions above.\n"
+                )
+            else:
+                sys.stderr.write(
+                    "[warning] No CSV block found in the model output. "
+                    "Check the run above for errors.\n"
+                )
 
 
 def main() -> None:
