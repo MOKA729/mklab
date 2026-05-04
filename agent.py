@@ -37,9 +37,27 @@ MAX_FINDINGS = 50
 
 # Where to write the classification CSV that you'll upload to Splunk.
 OUTPUT_CSV = "findings_classification.csv"
+
+# Write the AI classification back to each Splunk notable as a comment/note
+# via the Splunk ES REST API (POST /services/notable_update). Bypasses the
+# MCP server entirely. Requires Splunk Enterprise Security and a token
+# whose role has the `edit_notable_events` capability.
+WRITE_NOTES_VIA_API = True
+
+# Splunk REST API base URL. Auto-derived from SPLUNK_MCP_URL by default —
+# everything before "/services/mcp". Override here if the REST API is on
+# a different host/port.
+SPLUNK_REST_URL = SPLUNK_MCP_URL.split("/services/")[0]
+
+# Also overwrite each notable's urgency field to match the AI priority
+# (P0=critical, P1=high, P2=medium, P3=low, P4=informational). Default
+# False so we never clobber an analyst's existing urgency. Flip on if
+# you want the urgency column auto-set.
+UPDATE_URGENCY = False
 # ============================================================================
 
 import asyncio
+import csv as csv_module
 import json
 import os
 import re
@@ -176,6 +194,84 @@ def extract_csv_to_file(full_text: str, path: str) -> bool:
     return True
 
 
+_URGENCY_MAP = {
+    "P0": "critical",
+    "P1": "high",
+    "P2": "medium",
+    "P3": "low",
+    "P4": "informational",
+}
+
+
+async def write_notes_to_splunk(csv_path: str) -> None:
+    """For each row in the classification CSV, POST a comment to Splunk's
+    /services/notable_update endpoint so the AI triage shows up as a note
+    on the corresponding notable event in Incident Review."""
+
+    rows = []
+    with open(csv_path, encoding="utf-8") as f:
+        reader = csv_module.DictReader(f)
+        rows = list(reader)
+    if not rows:
+        sys.stderr.write("[notes] CSV had no rows; nothing to write back.\n")
+        return
+
+    sys.stderr.write(
+        f"[notes] Writing {len(rows)} comments to {SPLUNK_REST_URL} "
+        f"via POST /services/notable_update ...\n"
+    )
+
+    success = 0
+    failures: list[tuple[str, int, str]] = []
+
+    async with httpx.AsyncClient(verify=not IGNORE_SSL, timeout=30.0) as http:
+        for row in rows:
+            event_id = (row.get("event_id") or "").strip()
+            if not event_id:
+                continue
+
+            priority = (row.get("ai_priority") or "").strip()
+            score = (row.get("ai_score") or "").strip()
+            rationale = (row.get("ai_rationale") or "").strip()
+            action = (row.get("ai_recommended_action") or "").strip()
+
+            comment = (
+                f"[AI Triage] Priority: {priority} (score: {score})\n"
+                f"Rationale: {rationale}\n"
+                f"Recommended action: {action}"
+            )
+
+            data: dict[str, str] = {
+                "ruleUIDs": event_id,
+                "comment": comment,
+            }
+            if UPDATE_URGENCY and priority in _URGENCY_MAP:
+                data["urgency"] = _URGENCY_MAP[priority]
+
+            try:
+                resp = await http.post(
+                    f"{SPLUNK_REST_URL}/services/notable_update",
+                    data=data,
+                    headers={"Authorization": f"Bearer {SPLUNK_TOKEN}"},
+                )
+            except httpx.HTTPError as exc:
+                failures.append((event_id, 0, repr(exc)))
+                continue
+
+            if 200 <= resp.status_code < 300:
+                success += 1
+            else:
+                failures.append((event_id, resp.status_code, resp.text[:200]))
+
+    sys.stderr.write(f"[notes] {success}/{len(rows)} notable comments written.\n")
+    if failures:
+        sys.stderr.write(f"[notes] {len(failures)} failed:\n")
+        for event_id, status, body in failures[:5]:
+            sys.stderr.write(f"  - {event_id}: HTTP {status} — {body}\n")
+        if len(failures) > 5:
+            sys.stderr.write(f"  ... and {len(failures) - 5} more.\n")
+
+
 async def run() -> None:
     subprocess_env = {**os.environ}
     if IGNORE_SSL:
@@ -248,10 +344,16 @@ async def run() -> None:
             full = "".join(collected_text)
             if extract_csv_to_file(full, OUTPUT_CSV):
                 sys.stderr.write(
-                    f"[saved] Wrote classifications to {OUTPUT_CSV} — "
-                    "upload this file to Splunk as a lookup table per the "
-                    "instructions above.\n"
+                    f"[saved] Wrote classifications to {OUTPUT_CSV}.\n"
                 )
+                if WRITE_NOTES_VIA_API:
+                    await write_notes_to_splunk(OUTPUT_CSV)
+                else:
+                    sys.stderr.write(
+                        "[notes] WRITE_NOTES_VIA_API is False — skipping. "
+                        "Upload the CSV manually as a Splunk lookup if you "
+                        "still want it visible in Incident Review.\n"
+                    )
             else:
                 sys.stderr.write(
                     "[warning] No CSV block found in the model output. "
